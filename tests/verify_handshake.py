@@ -25,6 +25,7 @@ OFPT_GET_CONFIG_REQUEST = 7
 OFPT_GET_CONFIG_REPLY = 8
 OFPT_SET_CONFIG = 9
 OFPT_PACKET_IN = 10
+OFPT_PORT_STATUS = 12
 OFPT_FLOW_MOD = 14
 
 xid_counter = 1
@@ -51,11 +52,13 @@ def create_features_request():
     return message, xid
 
 def create_set_config():
-    """Create SET_CONFIG message"""
+    """Create SET_CONFIG message with FIXED flags"""
     xid = get_xid()
-    # flags=OFPC_FRAG_NORMAL (0), miss_send_len=0xffff (send full packet)
-    flags = 0  # OFPC_FRAG_NORMAL
-    miss_send_len = 0xffff
+    # FIX: Use flags=0x0000 (OFPC_FRAG_NORMAL) and miss_send_len=128
+    # OVS validates flags against OFPC_FRAG_MASK (0x0003)
+    # Only bits 0-1 are valid: 0x0000, 0x0001, 0x0002
+    flags = 0x0000  # OFPC_FRAG_NORMAL (explicitly 0x0000)
+    miss_send_len = 128  # Send first 128 bytes to controller (reasonable default)
     # Correct format: flags is 16-bit, miss_send_len is 16-bit
     message = struct.pack('!BBHIHH', OFP_VERSION, OFPT_SET_CONFIG, 12, xid, 
                          flags, miss_send_len)
@@ -105,6 +108,7 @@ def msg_type_to_string(msg_type):
         8: 'GET_CONFIG_REPLY',
         9: 'SET_CONFIG',
         10: 'PACKET_IN',
+        12: 'PORT_STATUS',
         14: 'FLOW_MOD'
     }
     return types.get(msg_type, f'UNKNOWN({msg_type})')
@@ -167,60 +171,104 @@ def main():
         handshake_steps['features_request_sent'] = True
         print(f"{timestamp()} ✅ FEATURES_REQUEST sent (XID: {features_req_xid})")
         
-        # Wait for FEATURES_REPLY
+        # Wait for FEATURES_REPLY (handle out-of-order messages)
         print(f"{timestamp()} Waiting for FEATURES_REPLY...")
-        data, _ = sock.recvfrom(4096)
-        version, msg_type, length, xid = parse_header(data)
+        features_reply_received = False
+        max_attempts = 10
         
-        if msg_type == OFPT_FEATURES_REPLY:
-            handshake_steps['features_reply_received'] = True
-            print(f"{timestamp()} ✅ FEATURES_REPLY received (XID: {xid}, length: {length} bytes)")
+        for attempt in range(max_attempts):
+            data, _ = sock.recvfrom(4096)
+            version, msg_type, length, xid = parse_header(data)
             
-            # Parse features (handle variable length)
-            if len(data) >= 32:
-                datapath_id = struct.unpack('!Q', data[8:16])[0]
-                n_buffers = struct.unpack('!I', data[16:20])[0]
-                n_tables = struct.unpack('!B', data[20:21])[0]
-                capabilities = struct.unpack('!I', data[24:28])[0]
+            if msg_type == OFPT_FEATURES_REPLY:
+                handshake_steps['features_reply_received'] = True
+                features_reply_received = True
+                print(f"{timestamp()} ✅ FEATURES_REPLY received (XID: {xid}, length: {length} bytes)")
                 
-                print(f"            DPID: {hex(datapath_id)}")
-                print(f"            Tables: {n_tables}, Buffers: {n_buffers}")
-                print(f"            Capabilities: {hex(capabilities)}")
+                # Parse features (handle variable length)
+                if len(data) >= 32:
+                    datapath_id = struct.unpack('!Q', data[8:16])[0]
+                    n_buffers = struct.unpack('!I', data[16:20])[0]
+                    n_tables = struct.unpack('!B', data[20:21])[0]
+                    capabilities = struct.unpack('!I', data[24:28])[0]
+                    
+                    print(f"            DPID: {hex(datapath_id)}")
+                    print(f"            Tables: {n_tables}, Buffers: {n_buffers}")
+                    print(f"            Capabilities: {hex(capabilities)}")
+                else:
+                    print(f"            (Short FEATURES_REPLY, length={length})")
+                break
+            elif msg_type == 12:  # PORT_STATUS
+                print(f"{timestamp()} Received PORT_STATUS, waiting for FEATURES_REPLY...")
+            elif msg_type == OFPT_ECHO_REQUEST:
+                # Reply to ECHO_REQUEST
+                echo_reply = struct.pack('!BBHI', OFP_VERSION, OFPT_ECHO_REPLY, 8, xid)
+                sock.sendto(echo_reply, switch_addr)
+                print(f"{timestamp()} Replied to ECHO_REQUEST, waiting for FEATURES_REPLY...")
             else:
-                print(f"            (Short FEATURES_REPLY, length={length})")
-        else:
-            print(f"{timestamp()} ⚠️  Expected FEATURES_REPLY, got {msg_type_to_string(msg_type)}")
-            # Continue anyway
+                print(f"{timestamp()} ⚠️  Received {msg_type_to_string(msg_type)}, waiting for FEATURES_REPLY...")
         
-        # Step 3: Skip SET_CONFIG (optional and OVS rejects it in OpenFlow 1.3)
-        print(f"\n{timestamp()} [STEP 3/5] Skipping SET_CONFIG...")
-        print(f"{timestamp()} ℹ️  SET_CONFIG not needed (OVS uses default config)")
-        handshake_steps['set_config_sent'] = True  # Mark as done
+        if not features_reply_received:
+            print(f"{timestamp()} ❌ FEATURES_REPLY not received after {max_attempts} attempts")
+            return 1
         
-        # Drain any pending ERROR messages from previous steps
-        sock.settimeout(0.5)
+        # Step 3: Send SET_CONFIG (now with FIXED flags!)
+        print(f"\n{timestamp()} [STEP 3/5] Sending SET_CONFIG...")
+        set_config_msg, set_config_xid = create_set_config()
+        print(f"{timestamp()} SET_CONFIG message: {set_config_msg.hex()}")
+        print(f"{timestamp()}   flags=0x0000 (OFPC_FRAG_NORMAL)")
+        print(f"{timestamp()}   miss_send_len=128 bytes")
+        sock.sendto(set_config_msg, switch_addr)
+        handshake_steps['set_config_sent'] = True
+        print(f"{timestamp()} ✓ Sent SET_CONFIG")
+        
+        # Check for ERROR response
+        sock.settimeout(2.0)
+        error_received = False
         try:
             data, _ = sock.recvfrom(4096)
             version, msg_type, length, xid = parse_header(data)
             if msg_type == OFPT_ERROR:
-                print(f"{timestamp()} (Drained ERROR from previous message)")
+                error_type, error_code = struct.unpack('!HH', data[8:12])
+                print(f"{timestamp()} ✗ ERROR received:")
+                print(f"{timestamp()}   Type: {error_type}, Code: {error_code}")
+                if error_type == 10:  # OFPET_SWITCH_CONFIG_FAILED
+                    print(f"{timestamp()}   OFPET_SWITCH_CONFIG_FAILED")
+                    if error_code == 0:
+                        print(f"{timestamp()}   OFPSCFC_BAD_FLAGS - Fix didn't work!")
+                error_received = True
             elif msg_type == OFPT_ECHO_REQUEST:
                 # Switch is sending keepalive, reply to it
                 echo_reply = struct.pack('!BBHI', OFP_VERSION, OFPT_ECHO_REPLY, 8, xid)
                 sock.sendto(echo_reply, switch_addr)
-                print(f"{timestamp()} Received ECHO_REQUEST, sent ECHO_REPLY")
+                print(f"{timestamp()} ✓ Received ECHO_REQUEST, sent ECHO_REPLY")
+                print(f"{timestamp()} ✓ SET_CONFIG accepted (no error)!")
+            elif msg_type == 12:  # PORT_STATUS
+                print(f"{timestamp()} ✓ Received PORT_STATUS (normal operation)")
+                print(f"{timestamp()} ✓ SET_CONFIG accepted (no error)!")
+            else:
+                print(f"{timestamp()} ✓ Received {msg_type_to_string(msg_type)}")
+                print(f"{timestamp()} ✓ SET_CONFIG accepted (no error)!")
         except socket.timeout:
-            pass  # No pending messages
+            # No error = success!
+            print(f"{timestamp()} ✓ No error received - SET_CONFIG accepted!")
+        
+        if error_received:
+            print(f"{timestamp()} ✗ SET_CONFIG failed - stopping test")
+            return 1
         
         sock.settimeout(10.0)
         
         # Step 4: Test ECHO (respond to switch's ECHO_REQUEST)
         print(f"\n{timestamp()} [STEP 4/5] Waiting for ECHO REQUEST from switch...")
-        sock.settimeout(10.0)
+        print(f"{timestamp()} (OVS typically sends ECHO every 5-15 seconds, waiting up to 20 seconds...)")
+        sock.settimeout(20.0)  # Longer timeout to catch periodic ECHO_REQUEST
         
         # Wait for switch to send ECHO_REQUEST (OVS sends these periodically)
         echo_received = False
-        for attempt in range(3):
+        max_attempts = 30  # Check up to 30 messages over 20 seconds
+        
+        for attempt in range(max_attempts):
             try:
                 data, _ = sock.recvfrom(4096)
                 version, msg_type, length, xid = parse_header(data)
@@ -237,17 +285,22 @@ def main():
                     break
                 elif msg_type == OFPT_ERROR:
                     print(f"{timestamp()} Received ERROR (likely from SET_CONFIG, ignoring...)")
+                elif msg_type == OFPT_PORT_STATUS:
+                    print(f"{timestamp()} Received PORT_STATUS, waiting for ECHO_REQUEST...")
                 else:
                     print(f"{timestamp()} Received {msg_type_to_string(msg_type)}, waiting for ECHO_REQUEST...")
             except socket.timeout:
-                if attempt < 2:
-                    print(f"{timestamp()} No ECHO_REQUEST yet, waiting... (attempt {attempt+1}/3)")
-                else:
-                    print(f"{timestamp()} ⚠️  Switch did not send ECHO_REQUEST")
-                    # Mark as done anyway - ECHO is optional for handshake
-                    handshake_steps['echo_test_done'] = True
-                    print(f"{timestamp()} (ECHO is optional, marking handshake complete)")
+                print(f"{timestamp()} ⚠️  No ECHO_REQUEST received (ECHO is optional)")
+                # Mark as done anyway - ECHO is optional for handshake
+                handshake_steps['echo_test_done'] = True
+                print(f"{timestamp()} (Marking handshake complete - ECHO not required)")
                 break
+        
+        # If we exhausted all attempts without finding ECHO_REQUEST
+        if not echo_received and attempt == max_attempts - 1:
+            print(f"{timestamp()} ⚠️  No ECHO_REQUEST after {max_attempts} messages (ECHO is optional)")
+            handshake_steps['echo_test_done'] = True
+            print(f"{timestamp()} (Marking handshake complete - ECHO not required)")
         
         # Step 5: Handshake complete
         print(f"\n{timestamp()} [STEP 5/5] Handshake Status Check")

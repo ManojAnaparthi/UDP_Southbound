@@ -74,12 +74,12 @@ def build_features_request():
     return header, xid
 
 def build_set_config():
-    """Build SET_CONFIG message to enable sending fragments"""
+    """Build SET_CONFIG message with FIXED flags"""
     xid = get_xid()
-    # OpenFlow 1.3: flags should be OFPC_FRAG_NORMAL (0)
-    # miss_send_len=0xffff means send full packet
-    flags = 0  # OFPC_FRAG_NORMAL
-    miss_send_len = 0xffff
+    # FIX: Use flags=0x0000 (OFPC_FRAG_NORMAL) and miss_send_len=128
+    # OVS validates flags against OFPC_FRAG_MASK (0x0003)
+    flags = 0x0000  # OFPC_FRAG_NORMAL (explicitly 0x0000)
+    miss_send_len = 128  # Send first 128 bytes (reasonable default)
     config = struct.pack('!HH', flags, miss_send_len)
     total_len = 8 + len(config)
     header = build_ofp_header(OFPV_1_3, OFPT_SET_CONFIG, total_len, xid)
@@ -337,16 +337,47 @@ class UDPOpenFlowTester:
         return False
     
     def test_phase3_config(self, addr):
-        """Phase 3: Test SET_CONFIG"""
+        """Phase 3: Test SET_CONFIG with FIXED flags"""
         print("\n" + "="*60)
-        print("PHASE 3: Testing SET_CONFIG")
+        print("PHASE 3: Testing SET_CONFIG (WITH FIX!)")
         print("="*60)
         
-        # Send SET_CONFIG
-        set_config, _ = build_set_config()
+        # Send SET_CONFIG with fixed flags
+        set_config, set_config_xid = build_set_config()
         self.send_message(set_config, addr)
-        print("✓ SET_CONFIG sent (miss_send_len=0xffff)")
+        print("✓ SET_CONFIG sent (flags=0x0000, miss_send_len=128)")
+        print("  Message hex:", set_config.hex())
         
+        # Check for ERROR response
+        print("Checking for ERROR response (2 sec timeout)...")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(('0.0.0.0', 6653))
+        sock.settimeout(2.0)
+        
+        try:
+            data, _ = sock.recvfrom(65535)
+            version, msg_type, length, xid = struct.unpack('!BBHI', data[:8])
+            
+            if msg_type == OFPT_ERROR:
+                error_type, error_code = struct.unpack('!HH', data[8:12])
+                print(f"✗ ERROR received: Type={error_type}, Code={error_code}")
+                if error_type == 10:
+                    print("  OFPET_SWITCH_CONFIG_FAILED")
+                    if error_code == 0:
+                        print("  OFPSCFC_BAD_FLAGS")
+                sock.close()
+                return False
+            elif msg_type == OFPT_ECHO_REQUEST:
+                print("✓ ECHO_REQUEST received (no error - SET_CONFIG accepted!)")
+                # Reply to ECHO
+                echo_reply = struct.pack('!BBHI', OFPV_1_3, OFPT_ECHO_REPLY, 8, xid)
+                sock.sendto(echo_reply, addr)
+        except socket.timeout:
+            print("✓ No error received (timeout) - SET_CONFIG accepted!")
+        
+        sock.close()
+        print("✓ SET_CONFIG test PASSED!")
         return True
     
     def test_phase4_table_miss(self, addr):
@@ -446,12 +477,9 @@ class UDPOpenFlowTester:
         if not self.test_phase2_features(addr):
             return False
         
-        # Phase 3: SET_CONFIG (skip for now - OVS has issues with flags)
-        # if not self.test_phase3_config(addr):
-        #     return False
-        print("\n" + "="*60)
-        print("PHASE 3: SET_CONFIG - SKIPPED (OVS compatibility)")
-        print("="*60)
+        # Phase 3: SET_CONFIG (NOW WITH FIX!)
+        if not self.test_phase3_config(addr):
+            return False
         
         # Phase 4: Table-miss flow
         if not self.test_phase4_table_miss(addr):

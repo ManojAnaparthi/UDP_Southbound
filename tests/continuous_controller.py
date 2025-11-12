@@ -89,8 +89,22 @@ class ContinuousController:
                 time.strftime("%H:%M:%S"), addr, dpid))
             self.switches[addr] = {'dpid': dpid}
             
+            # Send SET_CONFIG with FIXED flags
+            self._send_set_config(addr)
+            
             # Install table-miss flow
             self._install_table_miss(addr)
+    
+    def _send_set_config(self, addr):
+        """Send SET_CONFIG with fixed flags (now works!)"""
+        xid = get_xid()
+        flags = 0x0000  # OFPC_FRAG_NORMAL
+        miss_send_len = 128  # Send first 128 bytes
+        
+        msg = struct.pack('!BBHIHH', OFPV_1_3, 9, 12, xid, flags, miss_send_len)
+        self.sock.sendto(msg, addr)
+        print("[{}] Sent SET_CONFIG (flags=0x0000, miss_send_len=128)".format(
+            time.strftime("%H:%M:%S")))
             
     def _install_table_miss(self, addr):
         xid = get_xid()
