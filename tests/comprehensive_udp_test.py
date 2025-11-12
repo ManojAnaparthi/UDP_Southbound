@@ -2,6 +2,11 @@
 """
 Comprehensive OVS UDP OpenFlow Testing
 Tests all phases systematically to identify where PACKET_IN fails
+
+Enhanced with:
+- Proper ERROR message decoding
+- ECHO_REQUEST/REPLY handling
+- Connection keepalive
 """
 
 import socket
@@ -10,6 +15,8 @@ import time
 import sys
 import os
 import subprocess
+import binascii
+import threading
 
 # OpenFlow constants
 OFPV_1_3 = 0x04
@@ -25,6 +32,21 @@ OFPT_SET_CONFIG = 9
 OFPT_PACKET_IN = 10
 OFPT_FLOW_MOD = 14
 OFPT_PACKET_OUT = 13
+
+# Error type names
+ERROR_TYPES = {
+    0: "OFPET_HELLO_FAILED",
+    1: "OFPET_BAD_REQUEST",
+    2: "OFPET_BAD_ACTION",
+    3: "OFPET_BAD_INSTRUCTION",
+    4: "OFPET_BAD_MATCH",
+    5: "OFPET_FLOW_MOD_FAILED",
+    6: "OFPET_GROUP_MOD_FAILED",
+    7: "OFPET_PORT_MOD_FAILED",
+    8: "OFPET_TABLE_MOD_FAILED",
+    9: "OFPET_QUEUE_OP_FAILED",
+    10: "OFPET_SWITCH_CONFIG_FAILED",
+}
 
 # XID counter
 xid_counter = 1
@@ -157,23 +179,85 @@ class UDPOpenFlowTester:
         self.controller_port = controller_port
         self.sock = None
         self.switches = {}
+        self.running = True
+        self.echo_thread = None
+        
+    def _handle_error(self, data, addr):
+        """Decode and log OpenFlow ERROR messages"""
+        if len(data) < 12:
+            print("  ⚠ ERROR message too short from {}".format(addr))
+            return
+        
+        # Parse error type and code
+        err_type, err_code = struct.unpack('!HH', data[8:12])
+        err_data = data[12:]  # Offending message bytes
+        
+        err_type_name = ERROR_TYPES.get(err_type, "UNKNOWN_ERROR_TYPE")
+        
+        print("  ✗ OFPT_ERROR from {}".format(addr))
+        print("    Error Type: {} ({})".format(err_type, err_type_name))
+        print("    Error Code: {}".format(err_code))
+        print("    ERROR payload (hex): {}".format(binascii.hexlify(err_data).decode()))
+        
+        if len(err_data) >= 8:
+            bad_ver, bad_type, bad_len, bad_xid = struct.unpack('!BBHI', err_data[:8])
+            print("    Offending msg header: ver={} type={} len={} xid={}".format(
+                bad_ver, bad_type, bad_len, bad_xid))
+        
+        if len(err_data) > 8:
+            print("    Offending msg (first 64 bytes): {}".format(
+                binascii.hexlify(err_data[:64]).decode()))
+    
+    def _handle_echo_request(self, msg, addr):
+        """Handle ECHO_REQUEST from switch"""
+        # Reply with ECHO_REPLY using same xid
+        echo_reply = build_ofp_header(OFPV_1_3, OFPT_ECHO_REPLY, msg['length'], msg['xid'])
+        self.sock.sendto(echo_reply, addr)
+        print("  ↔ ECHO_REQUEST received, sent ECHO_REPLY (xid={})".format(msg['xid']))
+    
+    def _echo_pinger(self):
+        """Periodically send ECHO_REQUEST to keep connection alive"""
+        while self.running:
+            time.sleep(5)  # Send every 5 seconds
+            for addr in list(self.switches.keys()):
+                xid = get_xid()
+                echo_req = build_ofp_header(OFPV_1_3, OFPT_ECHO_REQUEST, 8, xid)
+                self.sock.sendto(echo_req, addr)
+                print("  ↔ Sent keepalive ECHO_REQUEST to {} (xid={})".format(addr, xid))
         
     def start(self):
-        """Start UDP listener"""
+        """Start UDP listener and echo pinger thread"""
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((self.controller_ip, self.controller_port))
         self.sock.settimeout(1.0)  # 1 second timeout
         print('✓ UDP controller listening on {}:{}'.format(self.controller_ip, self.controller_port))
         
+        # Start echo pinger thread for keepalive
+        self.echo_thread = threading.Thread(target=self._echo_pinger, daemon=True)
+        self.echo_thread.start()
+        print('✓ ECHO keepalive thread started')
+        
     def wait_for_message(self, expected_type=None, timeout=5):
-        """Wait for a specific message type"""
+        """Wait for a specific message type, handle ECHO and ERROR automatically"""
         start = time.time()
         while time.time() - start < timeout:
             try:
                 data, addr = self.sock.recvfrom(65535)
                 msg = parse_message(data)
                 if msg:
+                    # Handle ECHO_REQUEST automatically
+                    if msg['type'] == OFPT_ECHO_REQUEST:
+                        self._handle_echo_request(msg, addr)
+                        continue  # Don't return, wait for expected message
+                    
+                    # Handle ERROR messages
+                    if msg['type'] == OFPT_ERROR:
+                        self._handle_error(data, addr)
+                        if expected_type == OFPT_ERROR:
+                            return msg, addr
+                        continue  # Keep waiting unless we expected an error
+                    
                     print("  ← Received {} from {}".format(msg['type_name'], addr))
                     if expected_type is None or msg['type'] == expected_type:
                         return msg, addr
@@ -182,12 +266,23 @@ class UDPOpenFlowTester:
         return None, None
     
     def send_message(self, message, addr):
-        """Send OpenFlow message"""
+        """Send OpenFlow message with validation"""
+        # Validate message length
+        length_field = struct.unpack('!H', message[2:4])[0]
+        actual_len = len(message)
+        
+        if length_field != actual_len:
+            print("  ⚠ WARNING: length mismatch header={} actual={}".format(length_field, actual_len))
+        
+        # Ensure 8-byte alignment for most messages
+        if actual_len % 8 != 0:
+            print("  ⚠ WARNING: message length {} not 8-byte aligned".format(actual_len))
+        
         self.sock.sendto(message, addr)
         msg_type = struct.unpack('!B', message[1:2])[0]
         type_names = {OFPT_HELLO: "HELLO", OFPT_FEATURES_REQUEST: "FEATURES_REQUEST",
                      OFPT_SET_CONFIG: "SET_CONFIG", OFPT_FLOW_MOD: "FLOW_MOD"}
-        print("  → Sent {}".format(type_names.get(msg_type, 'UNKNOWN')))
+        print("  → Sent {} ({} bytes)".format(type_names.get(msg_type, 'UNKNOWN'), actual_len))
     
     def test_phase1_hello(self):
         """Phase 1: Test basic HELLO exchange"""
@@ -296,14 +391,14 @@ class UDPOpenFlowTester:
         print("PHASE 5: Testing PACKET_IN Reception")
         print("="*60)
         
-        print("Waiting for PACKET_IN messages (20 seconds)...")
-        print("(Generate traffic with: sudo mn -c && sudo mn --topo single,2 --controller remote,ip=127.0.0.1,port=6653)")
-        print("(Then run in mininet: pingall)")
+        print("Waiting for PACKET_IN messages (30 seconds)...")
+        print("(Generate traffic with: sudo ip netns exec h1 ping -c 3 10.0.0.2)")
         
         packet_in_count = 0
+        echo_count = 0
         start = time.time()
         
-        while time.time() - start < 20:
+        while time.time() - start < 30:
             try:
                 data, recv_addr = self.sock.recvfrom(65535)
                 msg = parse_message(data)
@@ -313,13 +408,18 @@ class UDPOpenFlowTester:
                         print("  ✓ PACKET_IN #{} received!".format(packet_in_count))
                     elif msg['type'] == OFPT_ECHO_REQUEST:
                         # Reply to echo
-                        echo_reply = build_ofp_header(OFPV_1_3, OFPT_ECHO_REPLY, 
-                                                     msg['length'], msg['xid'])
-                        self.sock.sendto(echo_reply, recv_addr)
+                        self._handle_echo_request(msg, recv_addr)
+                        echo_count += 1
+                    elif msg['type'] == OFPT_ERROR:
+                        self._handle_error(data, recv_addr)
                     else:
-                        print("  Received {}".format(msg['type_name']))
+                        print("  ← Received {}".format(msg['type_name']))
             except socket.timeout:
                 continue
+        
+        print("\nStatistics:")
+        print("  PACKET_IN messages: {}".format(packet_in_count))
+        print("  ECHO_REQUEST handled: {}".format(echo_count))
         
         if packet_in_count > 0:
             print("\n✓ SUCCESS: Received {} PACKET_IN messages".format(packet_in_count))
@@ -404,8 +504,10 @@ Press Ctrl+C to stop.
         import traceback
         traceback.print_exc()
     finally:
+        tester.running = False  # Stop echo thread
         if tester.sock:
             tester.sock.close()
+        print("\nCleanup complete")
 
 if __name__ == '__main__':
     main()
