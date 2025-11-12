@@ -1,0 +1,72 @@
+================================================================================
+OpenFlow Handshake Verification Test
+================================================================================
+
+[19:21:46] [INIT] Controller listening on UDP 127.0.0.1:6653
+[19:21:46] [INIT] Waiting for OpenFlow handshake to begin...
+
+================================================================================
+HANDSHAKE SEQUENCE
+================================================================================
+
+[19:21:46] [STEP 1/5] Waiting for HELLO from switch...
+[19:21:48] ✅ HELLO received from ('127.0.0.1', 60984)
+            Version: 4, XID: 143
+[19:21:48] ✅ HELLO sent to switch (XID: 1)
+
+[19:21:48] [STEP 2/5] Sending FEATURES_REQUEST to switch...
+[19:21:48] ✅ FEATURES_REQUEST sent (XID: 2)
+[19:21:48] Waiting for FEATURES_REPLY...
+[19:21:48] ✅ FEATURES_REPLY received (XID: 2, length: 32 bytes)
+            DPID: 0xee7c34a3f649
+            Tables: 254, Buffers: 0
+            Capabilities: 0x4f
+
+[19:21:48] [STEP 3/5] Sending SET_CONFIG...
+[19:21:48] SET_CONFIG message: 0409000c0000000300000080
+[19:21:48]   flags=0x0000 (OFPC_FRAG_NORMAL)
+[19:21:48]   miss_send_len=128 bytes
+[19:21:48] ✓ Sent SET_CONFIG
+[19:21:50] ✓ No error received - SET_CONFIG accepted!
+
+[19:21:50] [STEP 4/5] Waiting for ECHO REQUEST from switch...
+[19:21:50] (OVS typically sends ECHO every 5-15 seconds, waiting up to 20 seconds...)
+[19:21:53] ✅ ECHO_REQUEST received from switch (XID: 0)
+[19:21:53] ✅ ECHO_REPLY sent (keepalive working!)
+
+[19:21:53] [STEP 5/5] Handshake Status Check
+
+================================================================================
+HANDSHAKE SUMMARY
+================================================================================
+✅ Hello Sent (REQUIRED): True
+✅ Hello Received (REQUIRED): True
+✅ Features Request Sent (REQUIRED): True
+✅ Features Reply Received (REQUIRED): True
+✅ Set Config Sent: True
+✅ Echo Test Done: True
+
+================================================================================
+🎉 HANDSHAKE COMPLETE!
+================================================================================
+
+✅ Core handshake successful:
+   • HELLO exchange: version negotiation done
+   • FEATURES exchange: switch capabilities received
+
+✅ SET_CONFIG sent (switch may have rejected it)
+✅ ECHO keepalive working
+
+Controller is now ready to:
+  • Install flows (FLOW_MOD)
+  • Receive packets (PACKET_IN)
+  • Query statistics
+  • Manage the switch
+
+
+[19:21:53] Staying alive for 10 seconds to observe any messages...
+[19:21:53] Received ERROR (XID: 3)
+[19:21:58] Received ECHO_REQUEST (XID: 0)
+[19:21:58] Sent ECHO_REPLY
+
+[19:22:00] Controller stopped
