@@ -1,25 +1,31 @@
-# E2E Tests (Clean)
+# E2E Tests
 
-This folder contains **new, clean end-to-end tests** that validate the requirement-compliant setup:
+End-to-end tests for validating OpenFlow over UDP.
 
-- **Modified Ryu** listening for OpenFlow over **UDP**
-- **OVS** configured with a **udp:** controller target
-- **Mininet** used to generate traffic
+## Test Files
 
-## Test: UDP southbound in Mininet
+| File | Description |
+|------|-------------|
+| `mininet_ryu_udp.py` | Interactive Mininet demo with step-by-step output |
+| `benchmark_tcp_udp.py` | TCP vs UDP latency comparison (50 samples each) |
+| `ofp_message_test_app.py` | Ryu app that tests all OpenFlow message types |
+| `ofp_message_test.py` | Runner script for OpenFlow message tests |
 
-Run:
+## Quick Start
 
+### Interactive Demo
 ```bash
-cd /home/manoz/Acads/CN_PR
-sudo python3 e2e_tests/udp_mininet_e2e.py
+sudo python3 e2e_tests/mininet_ryu_udp.py
 ```
 
-Outputs:
-- `e2e_tests/artifacts/ryu_udp.log`
-- `e2e_tests/artifacts/ovs_flows.txt`
+### Latency Benchmark
+```bash
+sudo python3 e2e_tests/benchmark_tcp_udp.py
+```
 
-## Notes
+## Artifacts
 
-- This test uses `ryu.app.simple_switch_13` (unmodified) to prove that only the transport changed.
-- If OVS does not actually include UDP OpenFlow runtime support, it may accept `udp:` in `ovs-vsctl` but will never show `is_connected=true`.
+Generated files in `artifacts/`:
+- `benchmark_summary.csv` - Raw latency data
+- `latency_boxplot.png` - Latency distribution chart
+- `latency_comparison.png` - Bar chart comparison

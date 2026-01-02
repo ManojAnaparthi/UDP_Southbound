@@ -1,0 +1,7 @@
+metric,transport,avg_ms,min_ms,max_ms,stdev_ms,samples
+echo_rtt,TCP,7.534,3.921,27.817,3.821,50
+echo_rtt,UDP,8.212,3.687,50.659,6.363,50
+flow_mod,TCP,13.187,10.896,19.093,1.526,50
+flow_mod,UDP,13.339,11.130,16.573,1.195,50
+stats,TCP,4.474,3.468,13.954,1.683,50
+stats,UDP,5.074,3.539,9.703,1.356,50

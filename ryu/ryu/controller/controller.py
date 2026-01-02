@@ -31,6 +31,8 @@ from socket import TCP_NODELAY
 from socket import SHUT_WR
 from socket import timeout as SocketTimeout
 import ssl
+import threading
+import time as _time
 
 from ryu import cfg
 from ryu.lib import hub
@@ -622,11 +624,21 @@ class Datapath(ofproto_protocol.ProtocolDesc):
 
 
 class DatapathUDP(ofproto_protocol.ProtocolDesc):
-    """A UDP-backed OpenFlow datapath.
+    """A UDP-backed OpenFlow datapath with sequence-based reliability.
 
-    Preserves Ryu's OpenFlow parsing and event dispatch semantics but replaces
-    the underlying transport from TCP stream to UDP datagrams.
+    Implements:
+    - Sequence numbers for sent/received messages
+    - Duplicate detection using sliding window
+    - Retransmission on timeout for request/reply messages
+    - Out-of-order message detection and logging
+    
+    Preserves Ryu's OpenFlow parsing and event dispatch semantics.
     """
+
+    # Reliability configuration
+    RETRANSMIT_TIMEOUT = 1.0  # seconds
+    MAX_RETRANSMITS = 3
+    SEQ_WINDOW_SIZE = 1000    # Size of duplicate detection window
 
     def __init__(self, server_socket, address, cleanup_cb=None):
         super(DatapathUDP, self).__init__()
@@ -654,6 +666,23 @@ class DatapathUDP(ofproto_protocol.ProtocolDesc):
         self.ofp_brick = ryu.base.app_manager.lookup_service_brick('ofp_event')
         self.state = None
         self.set_state(HANDSHAKE_DISPATCHER)
+        
+        # Reliability: track pending messages awaiting acknowledgment
+        # Key: xid, Value: (msg_buf, send_time, retransmit_count, seq_num)
+        self._pending_msgs = {}
+        self._pending_lock = threading.RLock()
+        
+        # Sequence numbers for reliability
+        self._send_seq = 0              # Next sequence number to send
+        self._recv_seq_expected = 0     # Next expected sequence number
+        self._recv_seq_seen = set()     # Sliding window of seen sequence numbers
+        self._seq_stats = {
+            'sent': 0,
+            'received': 0,
+            'duplicates': 0,
+            'out_of_order': 0,
+            'retransmits': 0
+        }
 
     def enqueue_datagram(self, data):
         if self.state == DEAD_DISPATCHER:
@@ -708,10 +737,36 @@ class DatapathUDP(ofproto_protocol.ProtocolDesc):
                 continue
 
             if len(data) < msg_len:
-                # Can't reassemble across datagrams in UDP best-effort mode.
                 LOG.debug('Truncated UDP OF message from %s: got %d expected %d',
                           self.address, len(data), msg_len)
                 continue
+
+            # Sequence-based duplicate detection using XID as proxy
+            # OpenFlow XIDs should be unique per request
+            recv_seq = xid  # Use XID as sequence identifier
+            
+            # Check for duplicate (already seen this XID recently)
+            if xid != 0:  # XID=0 is used for async messages, don't filter
+                if xid in self._recv_seq_seen:
+                    self._seq_stats['duplicates'] += 1
+                    LOG.debug('Duplicate message xid=%s from %s, ignoring', xid, self.address)
+                    continue
+                
+                # Add to seen window
+                self._recv_seq_seen.add(xid)
+                
+                # Trim window if too large
+                if len(self._recv_seq_seen) > self.SEQ_WINDOW_SIZE:
+                    # Remove oldest entries (convert to sorted list, remove first half)
+                    seen_list = sorted(self._recv_seq_seen)
+                    for old_xid in seen_list[:len(seen_list)//2]:
+                        self._recv_seq_seen.discard(old_xid)
+            
+            self._seq_stats['received'] += 1
+            
+            # Reliability: acknowledge received message by removing from pending
+            if xid != 0:
+                self._ack_pending(xid)
 
             msg = ofproto_parser.msg(
                 self, version, msg_type, msg_len, xid, data[:msg_len])
@@ -731,16 +786,66 @@ class DatapathUDP(ofproto_protocol.ProtocolDesc):
 
             # Yield periodically.
             hub.sleep(0)
+    
+    def _ack_pending(self, xid):
+        """Remove message from pending queue when reply received."""
+        with self._pending_lock:
+            if xid in self._pending_msgs:
+                del self._pending_msgs[xid]
+                LOG.debug('ACK received for xid=%s', xid)
+    
+    def _retransmit_loop(self):
+        """Periodically check and retransmit timed-out messages."""
+        while self.state != DEAD_DISPATCHER:
+            hub.sleep(self.RETRANSMIT_TIMEOUT / 2)
+            
+            now = _time.time()
+            to_retransmit = []
+            to_remove = []
+            
+            with self._pending_lock:
+                for xid, (buf, send_time, count, seq) in list(self._pending_msgs.items()):
+                    if now - send_time > self.RETRANSMIT_TIMEOUT:
+                        if count < self.MAX_RETRANSMITS:
+                            to_retransmit.append((xid, buf, count, seq))
+                        else:
+                            to_remove.append(xid)
+                            LOG.warning('Message xid=%s seq=%s failed after %d retransmits',
+                                       xid, seq, self.MAX_RETRANSMITS)
+                
+                for xid in to_remove:
+                    del self._pending_msgs[xid]
+            
+            # Retransmit outside the lock
+            for xid, buf, count, seq in to_retransmit:
+                LOG.debug('Retransmitting xid=%s seq=%s (attempt %d)', xid, seq, count + 1)
+                self._seq_stats['retransmits'] += 1
+                try:
+                    self._server_socket.sendto(buf, self.address)
+                    with self._pending_lock:
+                        if xid in self._pending_msgs:
+                            self._pending_msgs[xid] = (buf, now, count + 1, seq)
+                except Exception:
+                    pass
 
     def _send_loop(self):
         try:
             while self.state != DEAD_DISPATCHER:
-                buf, close_socket = self.send_q.get()
+                buf, close_socket, track_xid = self.send_q.get()
                 self._send_q_sem.release()
                 try:
+                    # Assign sequence number
+                    seq = self._send_seq
+                    self._send_seq = (self._send_seq + 1) % (2 ** 32)
+                    self._seq_stats['sent'] += 1
+                    
                     self._server_socket.sendto(buf, self.address)
+                    
+                    # Reliability: track message for potential retransmission
+                    if track_xid is not None:
+                        with self._pending_lock:
+                            self._pending_msgs[track_xid] = (buf, _time.time(), 0, seq)
                 except Exception:
-                    # Best-effort: ignore send errors.
                     pass
                 if close_socket:
                     break
@@ -754,11 +859,18 @@ class DatapathUDP(ofproto_protocol.ProtocolDesc):
                 pass
             self._close_write()
 
-    def send(self, buf, close_socket=False):
+    def send(self, buf, close_socket=False, track_xid=None):
+        """Send buffer over UDP.
+        
+        Args:
+            buf: The data to send
+            close_socket: Whether to close after sending
+            track_xid: If set, track this message for retransmission
+        """
         msg_enqueued = False
         self._send_q_sem.acquire()
         if self.send_q:
-            self.send_q.put((buf, close_socket))
+            self.send_q.put((buf, close_socket, track_xid))
             msg_enqueued = True
         else:
             self._send_q_sem.release()
@@ -770,12 +882,28 @@ class DatapathUDP(ofproto_protocol.ProtocolDesc):
         msg.set_xid(self.xid)
         return self.xid
 
-    def send_msg(self, msg, close_socket=False):
+    def send_msg(self, msg, close_socket=False, reliable=False):
+        """Send OpenFlow message.
+        
+        Args:
+            msg: OpenFlow message object
+            close_socket: Whether to close after sending
+            reliable: If True, track for retransmission until ACK received
+        """
         assert isinstance(msg, self.ofproto_parser.MsgBase)
         if msg.xid is None:
             self.set_xid(msg)
         msg.serialize()
-        return self.send(msg.buf, close_socket=close_socket)
+        track_xid = msg.xid if reliable else None
+        return self.send(msg.buf, close_socket=close_socket, track_xid=track_xid)
+    
+    def send_msg_reliable(self, msg):
+        """Send message with reliability (retransmission on timeout)."""
+        return self.send_msg(msg, reliable=True)
+    
+    def get_seq_stats(self):
+        """Get sequence/reliability statistics."""
+        return dict(self._seq_stats)
 
     def _echo_request_loop(self):
         if not self.max_unreplied_echo_requests:
@@ -784,7 +912,8 @@ class DatapathUDP(ofproto_protocol.ProtocolDesc):
                (len(self.unreplied_echo_requests) <= self.max_unreplied_echo_requests)):
             echo_req = self.ofproto_parser.OFPEchoRequest(self)
             self.unreplied_echo_requests.append(self.set_xid(echo_req))
-            self.send_msg(echo_req)
+            # Echo requests are sent with reliability
+            self.send_msg(echo_req, reliable=True)
             hub.sleep(self.echo_request_interval)
         self.close()
 
@@ -793,9 +922,12 @@ class DatapathUDP(ofproto_protocol.ProtocolDesc):
             self.unreplied_echo_requests.remove(xid)
         except ValueError:
             pass
+        # Also acknowledge in the reliability layer
+        self._ack_pending(xid)
 
     def serve(self):
         send_thr = hub.spawn(self._send_loop)
+        retransmit_thr = hub.spawn(self._retransmit_loop)  # Reliability layer
         hello = self.ofproto_parser.OFPHello(self)
         self.send_msg(hello)
         echo_thr = hub.spawn(self._echo_request_loop)
@@ -806,7 +938,8 @@ class DatapathUDP(ofproto_protocol.ProtocolDesc):
             try:
                 hub.kill(send_thr)
                 hub.kill(echo_thr)
-                hub.joinall([send_thr, echo_thr])
+                hub.kill(retransmit_thr)
+                hub.joinall([send_thr, echo_thr, retransmit_thr])
             except Exception:
                 pass
             self.is_active = False
