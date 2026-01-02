@@ -629,6 +629,7 @@ Our tests show **0% packet loss** because we're testing on **localhost/loopback*
 |---------|--------|-------|
 | Packet loss testing (`tc netem`) | Planned | Validate retransmission under real conditions |
 | Adaptive timeout (RTT-based) | Planned | Better performance on variable latency |
+| Force mininet to defaultly use UDP instead of manually creating bridge to UDP-ryu controller | Planned | Makes it more production-ready |
 | DTLS encryption | Optional | Security for non-localhost deployments |
 
 ## References
