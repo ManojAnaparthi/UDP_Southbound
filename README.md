@@ -39,7 +39,6 @@ This project is the **production implementation** of earlier research work:
 | **Reliability** | Not implemented | Retransmission + ACK mechanism |
 | **Benchmarking** | Planned (Phase 6) | Complete (TCP vs UDP comparison) |
 | **Production Ready** | No (proof-of-concept) | Yes (installable, testable) |
-| **Lines of Code** | ~2000 (multiple modules) | ~500 (focused changes) |
 
 ### Evolution Timeline
 1. **Phase 1-5 (CN_Project_SDN):** Research, architecture analysis, protocol validation
@@ -97,54 +96,6 @@ ovs-vsctl --version
 # Should show: ovs-vsctl (Open vSwitch) 3.1.0
 ```
 
-### 3. Run E2E Test
-
-```bash
-sudo python3 e2e_tests/mininet_ryu_udp.py
-```
-
-Expected output:
-```
-============================================================
-  SUCCESS: Mininet hosts communicating via Ryu UDP controller!
-============================================================
-```
-
-## Manual Testing
-
-### Start Ryu with UDP Transport
-
-```bash
-cd ryu
-PYTHONPATH=. bin/ryu-manager \
-  --ofp-listen-host 0.0.0.0 \
-  --ofp-listen-transport udp \
-  --ofp-udp-listen-port 6653 \
-  ryu.app.simple_switch_13
-```
-
-### Create OVS Bridge with UDP Controller
-
-```bash
-sudo ovs-vsctl add-br br0
-sudo ovs-vsctl set bridge br0 protocols=OpenFlow13
-sudo ovs-vsctl set-controller br0 udp:127.0.0.1:6653
-```
-
-### Verify Connection
-
-```bash
-sudo ovs-vsctl list controller
-# Should show: is_connected: true, target: "udp:127.0.0.1:6653"
-```
-
-## TCP vs UDP Benchmark Results
-
-### Running the Benchmark
-
-```bash
-sudo python3 e2e_tests/benchmark_tcp_udp.py
-```
 
 ### Latency Comparison (50 samples each)
 
@@ -254,7 +205,7 @@ self._seq_stats = {
 
 | Limitation | Impact |
 |------------|--------|
-| **Manual reliability required** | Had to implement retransmission/ACK (150+ lines) |
+| **Lesser reliability** | Implemented retransmission/ACK |
 | **No congestion control** | Could flood network if not rate-limited |
 | **No flow control** | Receiver buffer overflow possible |
 | **Out-of-order delivery** | Application must handle if ordering matters |
@@ -276,7 +227,6 @@ self._seq_stats = {
 | **Failure Detection** | Automatic (TCP timeout) | Manual (Echo timeout) |
 | **Message Boundaries** | Stream (framing needed) | Preserved per datagram |
 | **Duplicate Detection** | Automatic | XID-based sliding window |
-| **Code Complexity** | Handled by kernel | ~200 lines added |
 
 ### When to Use Each
 
@@ -494,7 +444,7 @@ The `udp:` prefix tells OVS to use our custom UDP vconn class instead of the def
 
 | Issue | Solution |
 |-------|----------|
-| `is_connected: false` | Wait 5-10 seconds for handshake to complete |
+| `is_connected: false` | Wait for handshake to complete |
 | `Connection refused` in OVS logs | Ensure Ryu is running with `--ofp-listen-transport udp` |
 | `No module named 'ryu'` | Run `pip install -e .` in the ryu directory |
 | Ping fails between hosts | Wait for controller connection, check `ovs-ofctl dump-flows` |
@@ -689,3 +639,7 @@ Our tests show **0% packet loss** because we're testing on **localhost/loopback*
 - **OpenFlow 1.3 Spec:** [opennetworking.org](https://opennetworking.org/)
 - **QuicSDN Paper:** QUIC-based SDN Architecture
 - **SDUDP Paper:** TCP-to-UDP Conversion Framework
+
+## Note
+
+* Please read the comprehensive report (pdf) added in the repository
