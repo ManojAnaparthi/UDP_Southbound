@@ -1,0 +1,4 @@
+ovs-ctl-ipsec.patch
+CVE-2023-1668_ofproto-dpif-xlate_Always_mask_ip_proto_field.patch
+CVE-2023-5366-Fix-missing-masks-on-a-final-stage-with-ports-trie.patch
+CVE-2023-3966-netdev-offload-tc_Check_geneve_metadata_length.patch

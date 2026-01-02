@@ -1,0 +1,298 @@
+#!/usr/bin/make -f
+# -*- makefile -*-
+#export DH_VERBOSE=1
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+# While -fPIC is often the default, we explicitly enable it for this package
+# because it is a requirement for successful linking the static libopenvswitch
+# with shared libraries used for the Python JSON C extension.
+#
+# Ref: https://patchwork.ozlabs.org/project/openvswitch/patch/20220725121939.2710272-5-i.maximets@ovn.org/
+export DEB_CFLAGS_MAINT_APPEND = -fPIC
+
+%:
+	dh $@
+
+execute_after_dh_autoreconf:
+	patch -f --no-backup-if-mismatch -i $(CURDIR)/debian/ltmain-whole-archive.diff build-aux/ltmain.sh
+
+ifneq (,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
+PARALLEL = -j$(patsubst parallel=%,%,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
+else
+PARALLEL =
+endif
+
+PYTHON3S:=$(shell py3versions -vr)
+DEB_HOST_ARCH?=$(shell dpkg-architecture -qDEB_HOST_ARCH)
+
+override_dh_auto_configure:
+	test -d _debian || mkdir _debian
+	cd _debian && ( \
+		test -e Makefile || \
+		../configure --prefix=/usr --localstatedir=/var --enable-ssl \
+					 --sysconfdir=/etc \
+					 $(DATAPATH_CONFIGURE_OPTS) \
+					 $(EXTRA_CONFIGURE_OPTS) \
+					 )
+ifneq (,$(filter i386 amd64 ppc64el arm64 riscv64, $(DEB_HOST_ARCH)))
+	test -d _dpdk || mkdir _dpdk
+	cd _dpdk && ( \
+		test -e Makefile || \
+        ../configure --prefix=/usr --localstatedir=/var --enable-ssl \
+                     --with-dpdk=shared --sysconfdir=/etc \
+					 $(DATAPATH_CONFIGURE_OPTS) \
+					 $(EXTRA_CONFIGURE_OPTS) \
+					 )
+endif
+
+
+# NOTE(jamespage): by default, just run all tests
+TEST_LIST =
+TEST_LIST_DPDK =
+
+# armhf:
+#  30: bfd - check that BFD works together with RSTP   FAILED (bfd.at:829)
+ifneq (,$(filter armhf, $(DEB_HOST_ARCH)))
+TEST_LIST = 1-29 31-
+TEST_LIST_DPDK = $(TEST_LIST)
+endif # armhf
+
+# mipsel:
+#    20: bfd - bfd decay FAILED (bfd.at:396)
+#    21: bfd - bfd decay
+#   917: ofproto - asynchronous message control (OpenFlow 1.2) (ofproto.at:3183)
+#   918: ofproto - asynchronous message control (OpenFlow 1.3) FAILED (ovs-macros.at:241)
+#   927: ofproto - asynchronous message control (OpenFlow 1.3)  FAILED (ofproto.at:3405)
+#   919: ofproto - asynchronous message control (OpenFlow 1.4) FAILED (ovs-ofctl)
+#  1035: ofproto-dpif - select group with weights
+#  1036: ofproto-dpif - select group with weights        FAILED (ofproto-dpif.at:787)
+#  1057: ofproto-dpif - controller action without megaflows FAILED (ofproto-dpif.at:1893)
+#  1069: ofproto-dpif - controller action without megaflows
+#  1102: ofproto-dpif - continuation - resubmit FAILED (ovs-macros.at:241)
+#  1071: ofproto-dpif - controller action without megaflows
+#  1072: ofproto-dpif - controller action without megaflows FAILED (ofproto-dpif.at:2145)
+#  1136: ofproto-dpif - sFlow packet sampling - LACP structures
+ifneq (,$(filter mipsel, $(DEB_HOST_ARCH)))
+TEST_LIST = 1-19 22-531 533-916 920-926 928-1020 1022-1034 1037-1056 1058-1068 1070 1073-1101 1103-1135 1137-
+TEST_LIST_DPDK = $(TEST_LIST)
+endif # mipsel
+
+# mips64el:
+#    20: bfd - bfd decay FAILED (bfd.at:396)
+#  1033: ofproto-dpif - select group with weights
+#  1035: ofproto-dpif - select group with weights
+#  1057: ofproto-dpif - controller action without megaflows FAILED (ofproto-dpif.at:1893)
+#  1021: ofproto-dpif - select group with weights        FAILED (ofproto-dpif.at:535)
+#  1069: ofproto-dpif - controller action without megaflows
+ifneq (,$(filter mips64el, $(DEB_HOST_ARCH)))
+TEST_LIST = 1-19 22-531 533-1020 1022-1032 1034 1037-1056 1058-1068 1070 1072-1120 1122-
+TEST_LIST_DPDK = $(TEST_LIST)
+endif # mips64el
+
+# armel:
+#    27: bfd - check that BFD works together with RSTP   FAILED (bfd.at:830)
+#  1021: ofproto-dpif - select group with weights        FAILED (ofproto-dpif.at:535)
+#  1123: ofproto-dpif - sFlow packet sampling - LACP structures FAILED (ofproto-dpif.at:6643)
+ifneq (,$(filter armel, $(DEB_HOST_ARCH)))
+TEST_LIST = 1-19 22-26 28-531 533-1020 1022-1056 1058-1122 1124-
+TEST_LIST_DPDK = $(TEST_LIST)
+endif #armel
+
+# arm64:
+#   159: ofp-actions - inconsistent MPLS actions         FAILED (ofp-actions.at:819)
+#  1021: ofproto-dpif - select group with weights        FAILED (ofproto-dpif.at:535)
+#  1057: ofproto-dpif - controller action without megaflows FAILED (ofproto-dpif.at:1893)
+ifneq (,$(filter arm64, $(DEB_HOST_ARCH)))
+TEST_LIST = 1-19 21-158 160-531 533-1020 1022-1056 1058-
+TEST_LIST_DPDK = $(TEST_LIST)
+endif #arm64
+
+# alpha
+#  2724: ovn -- dns lookup : 1 HV, 2 LS, 2 LSPs/LS       FAILED (ovn.at:7451)
+#  2728: ovn -- vlan traffic for external network with distributed router gateway port FAILED (ovn.at:8563)
+#  2737: ovn -- IPv6 periodic RA                         FAILED (ovn.at:9916)
+ifneq (,$(filter alpha, $(DEB_HOST_ARCH)))
+TEST_LIST = 1-19 22-531 533-2723 2725-2727 2729-2736 2738-
+TEST_LIST_DPDK = $(TEST_LIST)
+endif #alpha
+
+# hppa
+#    20: bfd - bfd decay FAILED (bfd.at:314)
+#   758: tunnel - input with matching tunnel mask        FAILED (tunnel.at:132)
+#   847: ofproto - bundle del group (OpenFlow 1.5) FAILED (ofproto.at:813)
+#   850: ofproto - bundle remove group buckets FAILED (ofproto.at:1005)
+#   916: ofproto - asynchronous message control (OpenFlow 1.0) FAILED (ovs-macros.at:241)
+#   917: ofproto - asynchronous message control (OpenFlow 1.2) FAILED (ovs-macros.at:241)
+#   919: ofproto - asynchronous message control (OpenFlow 1.4) FAILED (ovs-ofctl)
+#   918: ofproto - asynchronous message control (OpenFlow 1.3) FAILED (ofproto.at:3371)
+#   942: ofproto - flow monitoring pause and resume FAILED (ofproto.at:4850)
+#   945: ofproto - asynchronous message control (OpenFlow 1.3) FAILED (ovs-macros.at:242)
+#   946: ofproto - asynchronous message control (OpenFlow 1.4) FAILED (ofproto.at:3638)
+#  1033: ofproto-dpif - masked set-field into metadata FAILED (ofproto-dpif.at:860)
+#  1021: ofproto-dpif - select group with weights FAILED (ofproto-dpif.at:535)
+#  1053: ofproto-dpif - balance-tcp bonding rebalance after link state changes FAILED (ofproto-dpif.at:482)
+#  1057: ofproto-dpif - controller action without megaflows FAILED (ofproto-dpif.at:1893)
+#  1102: ofproto-dpif - continuation - resubmit FAILED (ovs-macros.at:241)
+#  1105: ofproto-dpif - continuation - mirroring FAILED (ovs-macros.at:241)
+#  1123: ofproto-dpif - sFlow packet sampling - LACP structures FAILED (ofproto-dpif.at:6643)
+#  1155: ofproto-dpif - continuation - resubmit - OpenFlow10 FAILED (ovs-macros.at:242)
+#  1156: ofproto-dpif - continuation - resubmit - OpenFlow13 FAILED (ovs-macros.at:242)
+#  1159: ofproto-dpif - continuation - goto_table - OpenFlow10 FAILED (ovs-macros.at:242)
+#  1160: ofproto-dpif - continuation - goto_table - OpenFlow13 FAILED (ovs-macros.at:242)
+#  1161: ofproto-dpif - continuation - write_metadata - OpenFlow10 FAILED (ovs-macros.at:242)
+#  1162: ofproto-dpif - continuation - write_metadata - OpenFlow13 FAILED (ovs-macros.at:242)
+#  1181: ofproto - bundle with variable bfd/cfm config   FAILED (ofproto-dpif.at:8749)
+#  1187: ofproto-dpif - sFlow packet sampling - LACP structures FAILED (ofproto-dpif.at:7205)
+#  1209: ofproto-dpif - conntrack - zones                FAILED (ofproto-dpif.at:9898)
+#  1735: ovsdb-server combines updates on backlogged connections FAILED (ovsdb-server.at:1205)
+#  1806: ovsdb-server transaction history size           FAILED (ovsdb-server.at:1282)
+#  2193: RSTP - dummy interface FAILED (rstp.at:210)
+ifneq (,$(filter hppa, $(DEB_HOST_ARCH)))
+TEST_LIST = 1-19 22-531 533-757 759-846 848-849 851-915 920-941 943-944 947-1020 1022-1052 1054-1056 1058-1101 1103-1104 1106-1122 1124-1154 1157-1158 1163-1180 1182-1186 1188-1208 1210-1734 1736-1805 1807-2192 2194-
+TEST_LIST_DPDK = $(TEST_LIST)
+endif #hppa
+
+# sparc64
+#    20: bfd - bfd decay                                 FAILED (bfd.at:396)
+#    26: bfd - check that BFD works together with RSTP   FAILED (bfd.at:829)
+#   478: fuzz regression - ofp_print_fuzzer-5395207246839808 FAILED (fuzz-regression.at:12)
+#   927: ofproto - bundle packet-out makes bundle commit to fail(OpenFlow 1.4) FAILED (ofproto.at:2181)
+#   945: ofproto - asynchronous message control (OpenFlow 1.3) FAILED (ovs-macros.at:242)
+#   969: ofproto - flow monitoring pause and resume      FAILED (ofproto.at:4851)
+#   998: PMD - monitor threads                           FAILED (pmd.at:660)
+#  1057: ofproto-dpif - controller action without megaflows FAILED (ofproto-dpif.at:1893)
+#  1155: ofproto-dpif - continuation - resubmit - OpenFlow10 FAILED (ovs-macros.at:242)
+#  1156: ofproto-dpif - continuation - resubmit - OpenFlow13 FAILED (ovs-macros.at:242)
+#  1187: ofproto-dpif - sFlow packet sampling - LACP structures FAILED (ofproto-dpif.at:7205)
+#  2184: STP - dummy interface                           FAILED (stp.at:439)
+#  2185: STP - flush the fdb and mdb when topology changed FAILED (stp.at:529)
+#  2249: auto-attach - packets                           FAILED (auto-attach.at:5)
+ifneq (,$(filter sparc64, $(DEB_HOST_ARCH)))
+TEST_LIST = 1-19 22-25 27-477 479-531 533-926 928-944 946-968 970-997 999-1056 1058-1154 1157-1186 1188-2183 2186-2248 2250-
+TEST_LIST_DPDK = $(TEST_LIST)
+endif #sparc64
+
+# riscv64
+#  758: tunnel - input with matching tunnel mask        FAILED (tunnel.at:132)
+#  945: ofproto - asynchronous message control (OpenFlow 1.3) FAILED (ofproto.at:3372)
+#  946: ofproto - asynchronous message control (OpenFlow 1.4) FAILED (ovs-macros.at:242)
+#  969: ofproto - flow monitoring pause and resume      FAILED (ofproto.at:4851)
+#  1036: ofproto-dpif - select group with weights        ok
+#  1038: ALB - min num PMD/RxQ                           FAILED (ovs-macros.at:242)
+#  1039: ALB - cross-numa                                FAILED (ovs-macros.at:242)
+#  1040: ALB - PMD/RxQ assignment type                   FAILED (ovs-macros.at:242)
+#  1069: ofproto-dpif - select group with weights        FAILED (ofproto-dpif.at:863)
+#  1072: ofproto-dpif - controller action without megaflows FAILED (ofproto-dpif.at:2145)
+#  1105: ofproto-dpif - controller action without megaflows FAILED (ofproto-dpif.at:2221)
+#  1153: ofproto-dpif - continuation - actions - OpenFlow10 FAILED (ovs-macros.at:242)
+#  1154: ofproto-dpif - continuation - actions - OpenFlow13 FAILED (ovs-macros.at:242)
+#  1155: ofproto-dpif - continuation - resubmit - OpenFlow10 FAILED (ovs-macros.at:242)
+#  1156: ofproto-dpif - continuation - resubmit - OpenFlow13 FAILED (ovs-macros.at:242)
+#  1159: ofproto-dpif - continuation - goto_table - OpenFlow10 FAILED (ovs-macros.at:242)
+#  1160: ofproto-dpif - continuation - goto_table - OpenFlow13 FAILED (ovs-macros.at:242)
+#  1161: ofproto-dpif - continuation - write_metadata - OpenFlow10 FAILED (ovs-macros.at:242)
+#  1162: ofproto-dpif - continuation - write_metadata - OpenFlow13 FAILED (ovs-macros.at:242)
+#  1163: ofproto-dpif - continuation - data stack - OpenFlow10 FAILED (ovs-macros.at:242)
+#  1164: ofproto-dpif - continuation - data stack - OpenFlow13 FAILED (ovs-macros.at:242)
+#  1167: ofproto-dpif - continuation - patch ports - OpenFlow10 FAILED (ovs-macros.at:242)
+#  1168: ofproto-dpif - continuation - patch ports - OpenFlow13 FAILED (ovs-macros.at:242)
+#  1187: ofproto-dpif - sFlow packet sampling - LACP structures FAILED (ofproto-dpif.at:7205)
+#  1805: ovsdb-server combines updates on backlogged connections FAILED (ovsdb-server.at:1213)
+#  1806: ovsdb-server transaction history size           FAILED (ovsdb-server.at:1282)
+ifneq (,$(filter riscv64, $(DEB_HOST_ARCH)))
+TEST_LIST = 1-19 22-531 533-757 759-944 947-968 970-1020 1022-1035 1037 1041-1056 1058-1068 1070-1071 1073-1104 1106-1152 1157-1158 1165-1166 1169-1186 1188-1804 1807-
+TEST_LIST_DPDK = $(TEST_LIST)
+endif #riscv64
+
+# ia64
+#    20: bfd - bfd decay                                 FAILED (bfd.at:396)
+#  1021: ofproto-dpif - select group with weights        FAILED (ofproto-dpif.at:535)
+#  1057: ofproto-dpif - controller action without megaflows FAILED (ofproto-dpif.at:1893)
+ifneq (,$(filter ia64, $(DEB_HOST_ARCH)))
+TEST_LIST = 1-19 22-531 533-1020 1022-1056 1058-
+TEST_LIST_DPDK = $(TEST_LIST)
+endif #ia64
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	if $(MAKE) -C _debian check TESTSUITEFLAGS='$(PARALLEL) $(TEST_LIST)' || \
+                $(MAKE) -C _debian check TESTSUITEFLAGS='--recheck'; then :; \
+	else \
+		cat _debian/tests/testsuite.log; \
+		exit 1; \
+	fi
+# Skip DPDK testing on arm64 as builders don't have crc32 support
+# which is used in aarch64 based crc optimization in ovs >= 2.12.0~
+ifneq (,$(filter i386 amd64 ppc64el riscv64, $(DEB_HOST_ARCH)))
+	if $(MAKE) -C _dpdk check TESTSUITEFLAGS='$(PARALLEL) $(TEST_LIST_DPDK)' || \
+				$(MAKE) -C _dpdk check TESTSUITEFLAGS='--recheck'; then :; \
+	else \
+		cat _dpdk/tests/testsuite.log; \
+		exit 1; \
+	fi
+endif # i386/amd64/ppc64el
+endif # nocheck
+
+override_dh_auto_build:
+	dh_auto_build --sourcedirectory=_debian -- dist distdir=openvswitch
+	dh_auto_build --sourcedirectory=_debian
+ifneq (,$(filter i386 amd64 ppc64el arm64 riscv64, $(DEB_HOST_ARCH)))
+	dh_auto_build --sourcedirectory=_dpdk
+endif
+
+execute_before_dh_auto_clean:
+	find . -name "*.pyc" -delete
+
+override_dh_auto_install:
+	dh_auto_install --sourcedirectory=_debian
+
+execute_after_dh_install:
+	set -e && for pyvers in $(PYTHON3S); do \
+		cd python; \
+		export PKG_CONFIG_PATH=$(CURDIR)/debian/tmp/usr/lib/pkgconfig; \
+		export PKG_CONFIG_SYSROOT_DIR=$(CURDIR)/debian/tmp; \
+		export PKG_CONFIG_SYSTEM_INCLUDE_PATH=/; \
+		export PKG_CONFIG_SYSTEM_LIBRARY_PATH=/; \
+		enable_shared=no \
+		extra_cflags="`pkg-config --cflags libopenvswitch`" \
+		extra_libs="-Wl,-Bstatic -lopenvswitch -Wl,-Bdynamic `pkg-config --libs --static libopenvswitch`" \
+		python$$pyvers setup.py install --install-layout=deb \
+			--root $(CURDIR)/debian/python3-openvswitch; \
+		cd ..; \
+		mkdir -p $(CURDIR)/debian/openvswitch-test/usr/lib/python$$pyvers/dist-packages/ovstest; \
+		install -v -D python/ovstest/*.py \
+			$(CURDIR)/debian/openvswitch-test/usr/lib/python$$pyvers/dist-packages/ovstest; \
+	done
+
+override_dh_installinit:
+	dh_installinit --restart-after-upgrade
+	dh_installinit -popenvswitch-switch --name=ovsdb-server --no-start
+	dh_installinit -popenvswitch-switch --name=ovs-vswitchd --no-start
+	dh_installinit -popenvswitch-switch --name=ovs-record-hostname --no-start
+
+override_dh_installsystemd:
+	dh_installsystemd -popenvswitch-switch --name=ovsdb-server --no-start
+	dh_installsystemd -popenvswitch-switch --name=ovs-vswitchd --no-start
+	dh_installsystemd -popenvswitch-switch --name=ovs-record-hostname --no-start
+	dh_installsystemd --restart-after-upgrade -Xovs-vswitchd.service -Xovsdb-server.service -Xovs-record-hostname.service
+
+override_dh_strip:
+	dh_strip --dbgsym-migration='openvswitch-dbg (<< 2.17~)'
+
+override_dh_python3:
+	DEB_HOST_ARCH=$(DEB_HOST_ARCH) dh_python3 --shebang=/usr/bin/python3
+
+# Helper target for creating snapshots from upstream git
+DATE=$(shell date +%Y%m%d)
+# Upstream branch to track
+BRANCH=branch-3.1
+VERSION=3.1.0
+
+get-orig-snapshot:
+	rm -Rf openvswitch-upstream
+	git clone --branch $(BRANCH) --depth 1 https://github.com/openvswitch/ovs openvswitch-upstream
+	cd openvswitch-upstream && \
+		export COMMIT=`git rev-parse --short HEAD` && \
+		git archive --format tgz --prefix=openvswitch-$(VERSION)~git$(DATE).$$COMMIT/ \
+			-o ../../openvswitch_$(VERSION)~git$(DATE).$$COMMIT.orig.tar.gz $(BRANCH)
+	rm -Rf openvswitch-upstream

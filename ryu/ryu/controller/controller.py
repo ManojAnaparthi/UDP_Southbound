@@ -25,6 +25,7 @@ The main component of OpenFlow controller.
 import contextlib
 import logging
 import random
+import socket as _socket
 from socket import IPPROTO_TCP
 from socket import TCP_NODELAY
 from socket import SHUT_WR
@@ -58,9 +59,14 @@ CONF = cfg.CONF
 CONF.register_cli_opts([
     cfg.StrOpt('ofp-listen-host', default=DEFAULT_OFP_HOST,
                help='openflow listen host (default %s)' % DEFAULT_OFP_HOST),
+    cfg.StrOpt('ofp-listen-transport', default='tcp',
+            help='openflow listen transport: tcp (default), udp, or ssl'),
     cfg.IntOpt('ofp-tcp-listen-port', default=None,
                help='openflow tcp listen port '
                     '(default: %d)' % ofproto_common.OFP_TCP_PORT),
+    cfg.IntOpt('ofp-udp-listen-port', default=None,
+            help='openflow udp listen port '
+                '(default: %d)' % ofproto_common.OFP_TCP_PORT),
     cfg.IntOpt('ofp-ssl-listen-port', default=None,
                help='openflow ssl listen port '
                     '(default: %d)' % ofproto_common.OFP_SSL_PORT),
@@ -125,7 +131,14 @@ def _split_addr(addr):
 class OpenFlowController(object):
     def __init__(self):
         super(OpenFlowController, self).__init__()
-        if not CONF.ofp_tcp_listen_port and not CONF.ofp_ssl_listen_port:
+        self.ofp_listen_transport = (CONF.ofp_listen_transport or 'tcp').lower()
+
+        # UDP server state (used only when ofp_listen_transport == 'udp').
+        self._udp_server_socket = None
+        self._udp_datapaths = {}  # (ip, port) -> DatapathUDP
+
+        if (self.ofp_listen_transport != 'udp' and
+            not CONF.ofp_tcp_listen_port and not CONF.ofp_ssl_listen_port):
             self.ofp_tcp_listen_port = ofproto_common.OFP_TCP_PORT
             self.ofp_ssl_listen_port = ofproto_common.OFP_SSL_PORT
             # For the backward compatibility, we spawn a server loop
@@ -136,6 +149,11 @@ class OpenFlowController(object):
         else:
             self.ofp_tcp_listen_port = CONF.ofp_tcp_listen_port
             self.ofp_ssl_listen_port = CONF.ofp_ssl_listen_port
+
+        # UDP listen port defaults to the standard OpenFlow port (6653).
+        self.ofp_udp_listen_port = CONF.ofp_udp_listen_port
+        if self.ofp_udp_listen_port is None:
+            self.ofp_udp_listen_port = ofproto_common.OFP_TCP_PORT
 
         # Example:
         # self._clients = {
@@ -150,8 +168,16 @@ class OpenFlowController(object):
             addr = tuple(_split_addr(address))
             self.spawn_client_loop(addr)
 
-        self.server_loop(self.ofp_tcp_listen_port,
-                         self.ofp_ssl_listen_port)
+        if self.ofp_listen_transport == 'udp':
+            self.udp_server_loop(self.ofp_udp_listen_port)
+        elif self.ofp_listen_transport == 'ssl':
+            # Keep existing semantics: SSL listener on ssl port.
+            self.server_loop(self.ofp_tcp_listen_port,
+                             self.ofp_ssl_listen_port)
+        else:
+            # Default: TCP (and optional SSL, depending on cert opts).
+            self.server_loop(self.ofp_tcp_listen_port,
+                             self.ofp_ssl_listen_port)
 
     def spawn_client_loop(self, addr, interval=None):
         interval = interval or CONF.ofp_switch_connect_interval
@@ -208,6 +234,49 @@ class OpenFlowController(object):
         # LOG.debug('loop')
         server.serve_forever()
 
+    def _udp_cleanup_datapath(self, address):
+        dp = self._udp_datapaths.pop(address, None)
+        if dp is not None:
+            try:
+                dp.is_active = False
+            except Exception:
+                pass
+
+    def udp_server_loop(self, ofp_udp_listen_port):
+        """Listen for OpenFlow over UDP and demultiplex by sender address.
+
+        This runs a single UDP socket bound to (ofp-listen-host, port).
+        Each unique (ip, port) is treated as a separate datapath transport.
+
+        Best-effort mode: no retransmission/ACK. Reliability can be layered
+        later (Todo #8).
+        """
+        if self._udp_server_socket is None:
+            sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+            sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+            sock.bind((CONF.ofp_listen_host, ofp_udp_listen_port))
+            self._udp_server_socket = sock
+
+        LOG.info('OpenFlow UDP server listening on %s:%d',
+                 CONF.ofp_listen_host, ofp_udp_listen_port)
+
+        while True:
+            try:
+                data, addr = self._udp_server_socket.recvfrom(65535)
+            except Exception:
+                # Keep serving; a transient recv error should not kill the controller.
+                continue
+
+            dp = self._udp_datapaths.get(addr)
+            if dp is None:
+                dp = DatapathUDP(self._udp_server_socket, addr,
+                                 cleanup_cb=self._udp_cleanup_datapath)
+                self._udp_datapaths[addr] = dp
+                hub.spawn(dp.serve)
+
+            # Enqueue the full datagram for the datapath.
+            dp.enqueue_datagram(data)
+
 
 def _deactivate(method):
     def deactivate(self):
@@ -215,8 +284,10 @@ def _deactivate(method):
             method(self)
         finally:
             try:
-                self.socket.close()
-            except IOError:
+                sock = getattr(self, 'socket', None)
+                if sock is not None:
+                    sock.close()
+            except (AttributeError, IOError):
                 pass
 
     return deactivate
@@ -548,6 +619,197 @@ class Datapath(ofproto_protocol.ProtocolDesc):
 
     def is_reserved_port(self, port_no):
         return port_no > self.ofproto.OFPP_MAX
+
+
+class DatapathUDP(ofproto_protocol.ProtocolDesc):
+    """A UDP-backed OpenFlow datapath.
+
+    Preserves Ryu's OpenFlow parsing and event dispatch semantics but replaces
+    the underlying transport from TCP stream to UDP datagrams.
+    """
+
+    def __init__(self, server_socket, address, cleanup_cb=None):
+        super(DatapathUDP, self).__init__()
+
+        self._server_socket = server_socket
+        self.address = address
+        self._cleanup_cb = cleanup_cb
+        self.is_active = True
+
+        # Datagram RX queue (each entry is exactly one UDP packet).
+        self._rx_q = hub.Queue(1024)
+
+        # Sending queue (keep same backpressure pattern as TCP datapath).
+        self.send_q = hub.Queue(16)
+        self._send_q_sem = hub.BoundedSemaphore(self.send_q.maxsize)
+
+        self.echo_request_interval = CONF.echo_request_interval
+        self.max_unreplied_echo_requests = CONF.maximum_unreplied_echo_requests
+        self.unreplied_echo_requests = []
+
+        self.xid = random.randint(0, self.ofproto.MAX_XID)
+        self.id = None
+        self._ports = None
+        self.flow_format = ofproto_v1_0.NXFF_OPENFLOW10
+        self.ofp_brick = ryu.base.app_manager.lookup_service_brick('ofp_event')
+        self.state = None
+        self.set_state(HANDSHAKE_DISPATCHER)
+
+    def enqueue_datagram(self, data):
+        if self.state == DEAD_DISPATCHER:
+            return
+        try:
+            self._rx_q.put(data)
+        except Exception:
+            # Drop on overload (best-effort).
+            pass
+
+    def _close_write(self):
+        # UDP has no half-close.
+        return
+
+    def close(self):
+        self.set_state(DEAD_DISPATCHER)
+        self._close_write()
+        if self._cleanup_cb is not None:
+            try:
+                self._cleanup_cb(self.address)
+            except Exception:
+                pass
+
+    def set_state(self, state):
+        if self.state == state:
+            return
+        self.state = state
+        ev = ofp_event.EventOFPStateChange(self)
+        ev.state = state
+        if self.ofp_brick is not None:
+            self.ofp_brick.send_event_to_observers(ev, state)
+
+    @_deactivate
+    def _recv_loop(self):
+        # Each UDP datagram is expected to contain exactly one OpenFlow message.
+        # If longer than msg_len, we only parse the first message.
+        while self.state != DEAD_DISPATCHER:
+            try:
+                data = self._rx_q.get()
+            except Exception:
+                continue
+
+            if not data:
+                continue
+            if len(data) < ofproto_common.OFP_HEADER_SIZE:
+                continue
+
+            (version, msg_type, msg_len, xid) = ofproto_parser.header(data)
+            if msg_len < ofproto_common.OFP_HEADER_SIZE:
+                LOG.debug('UDP OF message with invalid length %s from %s',
+                          msg_len, self.address)
+                continue
+
+            if len(data) < msg_len:
+                # Can't reassemble across datagrams in UDP best-effort mode.
+                LOG.debug('Truncated UDP OF message from %s: got %d expected %d',
+                          self.address, len(data), msg_len)
+                continue
+
+            msg = ofproto_parser.msg(
+                self, version, msg_type, msg_len, xid, data[:msg_len])
+            if msg:
+                ev = ofp_event.ofp_msg_to_ev(msg)
+                if self.ofp_brick is not None:
+                    self.ofp_brick.send_event_to_observers(ev, self.state)
+
+                    def dispatchers(x):
+                        return x.callers[ev.__class__].dispatchers
+
+                    handlers = [handler for handler in
+                                self.ofp_brick.get_handlers(ev) if
+                                self.state in dispatchers(handler)]
+                    for handler in handlers:
+                        handler(ev)
+
+            # Yield periodically.
+            hub.sleep(0)
+
+    def _send_loop(self):
+        try:
+            while self.state != DEAD_DISPATCHER:
+                buf, close_socket = self.send_q.get()
+                self._send_q_sem.release()
+                try:
+                    self._server_socket.sendto(buf, self.address)
+                except Exception:
+                    # Best-effort: ignore send errors.
+                    pass
+                if close_socket:
+                    break
+        finally:
+            q = self.send_q
+            self.send_q = None
+            try:
+                while q.get(block=False):
+                    self._send_q_sem.release()
+            except hub.QueueEmpty:
+                pass
+            self._close_write()
+
+    def send(self, buf, close_socket=False):
+        msg_enqueued = False
+        self._send_q_sem.acquire()
+        if self.send_q:
+            self.send_q.put((buf, close_socket))
+            msg_enqueued = True
+        else:
+            self._send_q_sem.release()
+        return msg_enqueued
+
+    def set_xid(self, msg):
+        self.xid += 1
+        self.xid &= self.ofproto.MAX_XID
+        msg.set_xid(self.xid)
+        return self.xid
+
+    def send_msg(self, msg, close_socket=False):
+        assert isinstance(msg, self.ofproto_parser.MsgBase)
+        if msg.xid is None:
+            self.set_xid(msg)
+        msg.serialize()
+        return self.send(msg.buf, close_socket=close_socket)
+
+    def _echo_request_loop(self):
+        if not self.max_unreplied_echo_requests:
+            return
+        while (self.send_q and
+               (len(self.unreplied_echo_requests) <= self.max_unreplied_echo_requests)):
+            echo_req = self.ofproto_parser.OFPEchoRequest(self)
+            self.unreplied_echo_requests.append(self.set_xid(echo_req))
+            self.send_msg(echo_req)
+            hub.sleep(self.echo_request_interval)
+        self.close()
+
+    def acknowledge_echo_reply(self, xid):
+        try:
+            self.unreplied_echo_requests.remove(xid)
+        except ValueError:
+            pass
+
+    def serve(self):
+        send_thr = hub.spawn(self._send_loop)
+        hello = self.ofproto_parser.OFPHello(self)
+        self.send_msg(hello)
+        echo_thr = hub.spawn(self._echo_request_loop)
+
+        try:
+            self._recv_loop()
+        finally:
+            try:
+                hub.kill(send_thr)
+                hub.kill(echo_thr)
+                hub.joinall([send_thr, echo_thr])
+            except Exception:
+                pass
+            self.is_active = False
 
 
 def datapath_connection_factory(socket, address):
